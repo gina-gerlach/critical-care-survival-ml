@@ -1,0 +1,1907 @@
+---
+title: "survival_prediction"
+output:
+  html_document: default
+date: "2026-09-01"
+editor_options:
+  chunk_output_type: console
+  markdown:
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Survival Prediction with SUPPORT2 Dataset
+
+**Dataset URL:** <https://archive.ics.uci.edu/dataset/880/support2>
+
+**Title:** Forecasting 2- and 6-Month Survival of Critically Ill Patients with the Study to Understand Prognoses and Preferences for Outcomes and Risks of Treatment (SUPPORT2) Dataset
+
+**Prediction Problem:** Estimate the probability that a critically ill patient survives 2 and 6 months after hospital admission using routinely collected clinical and demographic data.
+
+**Research question:** How accurately can supervised machine learning models predict 2‑ and 6‑month survival in the SUPPORT2 cohort, and how does their performance compare to the original SUPPORT prognostic model based on discrimination metrics such as AUC and accuracy?
+
+**Hypotheses:**
+
+1.  **Prediction accuracy**\
+    The supervised machine learning models will achieve good discrimination (AUC ≈0.80 or higher) for both 2‑ and 6‑month survival and perform at least comparably to the original SUPPORT model on the held‑out test set.
+2.  **Model comparison**\
+    Gradient boosting and random forest models will show equal or better discrimination than logistic and LASSO regression, reflecting their ability to capture non‑linear and interaction effects in the predictors.
+3.  **Prediction horizon**\
+    Predictive performance will be slightly higher for 2‑month survival than for 6‑month survival, reflecting the greater uncertainty associated with longer‑term outcomes in critically ill patients.
+
+Formal statistical significance testing (for example, pairwise DeLong tests comparing AUCs across models) was planned but not completed within the available computation time, so results are interpreted descriptively rather than on the basis of p‑values.
+
+## 1. Setup and Package Installations
+
+Install required packages and set seed for reproducibility
+
+```{r}
+library(tidyverse)     # For data manipulation
+library(dplyr)         # For data manipulation
+library(caret)         # For machine learning framework
+library(mice)          # For missing data
+library(glmnet)        # For regularized regression (Lasso/Ridge)
+library(randomForest)  # For random forest models
+library(gbm)           # For gradient boosting
+library(xgboost)       # For gradient boosting
+library(e1071)         # For SVM
+library(nnet)          # For neural networks
+library(corrplot)      # For correlation plots
+library(ggplot2)       # For advanced visualizations and diamonds dataset
+library(gridExtra)     # For arranging multiple plots
+library(pROC)          # For ROC curves and AUC
+library(rpart.plot)    # For decision tree visualization
+library(doParallel)    # For efficient ML testing
+
+set.seed(42)
+
+```
+
+## 2. Data loading and Initial Inspection
+
+The SUPPORT2 dataset contains prospectively collected clinical data from 9,105 critically ill adult patients admitted to five United States hospitals between 1989–1991 and 1992–1994.
+Patients were enrolled with conditions such as acute respiratory failure, chronic obstructive pulmonary disease, congestive heart failure, liver disease, coma, colon cancer, lung cancer, and multiple organ system failure with or without malignancy or sepsis.
+The dataset includes 42 routinely collected variables, covering mortality and survival information, physician survival estimates, demographics (age, sex, race, income, education), hospital cost variables, comorbidities, Do Not Resuscitate (DNR) status, vital signs, laboratory values, and functional outcomes.
+
+```{r}
+df <- read.csv("support2.csv")
+# View(df) # checked and data were imported correctly
+
+```
+
+For this analysis, the primary outcome variables provided are death at any time during follow‑up (*death*), in‑hospital death (*hospdead*), and functional disability at two months (*sfdm2*), with *slos* (days from study entry to discharge) and *d.time* (days of follow‑up) serving as supporting time‑to‑event measures.
+Candidate predictors include demographic variables, baseline disease group and class, comorbidities, cost variables, physiology and severity scores, physician and model‑based survival estimates, DNR information, vital signs, laboratory tests, and activities of daily living measures (*adlp, adls, adlsc*).​
+
+The real‑world goal is to use these routinely collected variables to predict 2‑ and 6‑month survival after hospital admission, thereby informing clinical and end‑of‑life decision‑making for critically ill patients.​
+
+An initial structural review confirms that the dataset contains 9,105 observations and 47 variables, reflecting the 42 predictors plus three primary outcomes and two supporting time variables.
+Variable types are a mix of numeric and categorical, missing values are present in several predictors, and no duplicate rows are detected.
+
+```{r}
+
+cat("=== DATA STRUCTURE ===\n")
+str(df)  # Shows variable types and first few values
+
+cat("\n=== DATA DIMENSIONS ===\n")
+cat("Number of observations:", nrow(df), "\n")
+cat("Number of variables:", ncol(df), "\n")
+
+cat("\n=== FIRST FEW ROWS ===\n")
+head(df, 10)  # Show first 10 rows
+
+cat("\n=== LAST FEW ROWS ===\n")
+tail(df, 10)  # Check last few rows for any issues
+
+# Check for duplicate rows
+cat("\n=== DUPLICATE CHECK ===\n")
+cat("Number of duplicate rows:", sum(duplicated(df)), "\n")
+
+```
+
+### Initial Cleaning
+
+Because observed 2‑ and 6‑month survival are not directly available, new binary outcome variables are derived from *d.time* and *death*.
+For each patient, survival status at 60 and 180 days is coded as 0 for death before the time horizon and 1 for survival to or beyond the horizon; remaining patients are treated as censored and set to missing.
+
+```{r}
+
+df$obs_surv2 <- with(df,
+  ifelse(d.time < 60 & death == 1, 0, # died before 60 days
+    ifelse(d.time >= 60, 1,           # survived 60 days or died after
+      NA                              # alive but <60 days (censored)
+    )
+  )
+)
+
+df$obs_surv2 <- factor(df$obs_surv2,
+                            levels = c(0, 1),
+                            labels = c("No", "Yes"))
+
+cat("\nObserved 2-month Survival Statistics:\n")
+summary(df$obs_surv2)
+
+
+df$obs_surv6 <- with(df,
+  ifelse(d.time < 180 & death == 1, 0, # died before 180 days
+    ifelse(d.time >= 180, 1,           # survived 180 days or died after
+      NA                              # alive but <180 days (censored)
+    )
+  )
+)
+
+df$obs_surv6 <- factor(df$obs_surv6,
+                            levels = c(0, 1),
+                            labels = c("No", "Yes"))
+
+cat("\nObserved 6-month Survival Statistics:\n")
+summary(df$obs_surv6)
+
+```
+
+To avoid information leakage from post‑baseline outcomes or follow‑up lengths, *death*, *hospdead*, *slos*, and *d.time* are excluded from the predictor set after constructing *obs_surv2* and *obs_surv6*.
+The functional disability score *sfdm2* is not used as an outcome because there is no 6‑month analogue and is not retained as a predictor because it reflects post‑admission disability rather than baseline clinical or demographic information.​
+
+Hospital cost variables (*charges, totcst, totmcst*) are removed because they do not align with the clinical research question and may complicate interpretation without adding prognostic value.
+The dataset documentation recommends that previously derived prognostic scores (*aps, sps, surv2m, surv6m*) not be used as predictors when developing new models, and advises caution with physician estimates (*prg2m, prg6m*) and DNR variables (*dnr, dnrday*).
+In this analysis, *aps* and *sps* are removed, *dnr* and *dnrday* are dropped following guidance that DNR orders should not enter prognostic models, and *prg2m* and *prg6m* are retained for secondary analyses to assess the added value of physician judgment.
+The original SUPPORT survival predictions (*surv2m, surv6m*) are preserved only as external benchmarks for model comparison.
+
+The resulting working dataset for EDA and model development includes demographic, diagnostic, physiologic, and functional variables alongside the constructed survival outcomes.
+
+```{r}
+
+#Select relevant columns
+support2 <- df[, c("age","sex","dzgroup","dzclass","num.co","edu","income","scoma","avtisst","race","surv2m","surv6m","hday","diabetes","dementia","ca","meanbp","wblc","hrt","resp","temp","pafi","alb","bili","crea","sod","ph","glucose","bun","urine","adlp","adls","adlsc", "prg2m", "prg6m", "obs_surv2","obs_surv6")]
+
+```
+
+## 3. Exploratory Data Analysis
+
+### Summary Statistics
+
+A global summary of the working dataset highlights substantial missingness in several laboratory and functional variables, as well as variation in the distribution and scale of predictors.
+
+```{r}
+
+summary(support2)
+
+```
+
+To quantify missingness, the proportion of missing values is computed for each variable, and a bar plot is used to visualize patterns across predictors.
+
+### Missing Values Analysis
+
+```{r}
+
+cat("\n=== MISSING VALUES ANALYSIS ===\n")
+missing_count <- colSums(is.na(support2))
+missing_percent <- round(100 * missing_count / nrow(support2), 2)
+missing_df <- data.frame(
+  Variable = names(missing_count),
+  Missing_Count = missing_count,
+  Missing_Percent = missing_percent
+)
+print(missing_df)
+
+# Visualize missing values
+if(sum(missing_count) > 0) {
+  barplot(missing_percent, 
+          main = "Percentage of Missing Values by Variable",
+          ylab = "Percentage Missing (%)",
+          las = 2,
+          col = "coral")
+}
+
+```
+
+Variables with less than 10% missingness include *scoma, avtisst, surv2m, surv6m, meanbp, wblc, hrt, resp, temp, crea,* and *sod*.
+Moderate missingness (10–30%) is observed for *edu, pafi, prg2m,* and *prg6m*, while several laboratory and ADL measures (*alb, bili, ph, glucose, bun, urine, adlp, adls*) show more than 30% missing values and will require careful handling during preprocessing.
+
+### Target Variable Analysis
+
+The class balance of the constructed survival outcomes is examined to understand the difficulty of the prediction task and to inform later modeling choices.​
+
+```{r}
+cat("\n=== TARGET VARIABLE ANALYSIS ===\n")
+cat("\nTarget 1: 2-month Survival")
+
+# Frequency table
+cat("\nClass Distribution:\n")
+table(support2$obs_surv2)
+cat("\nClass Proportions:\n")
+prop.table(table(support2$obs_surv2))
+
+# Visualize class distribution
+par(mfrow = c(1, 2))
+barplot(table(support2$obs_surv2), 
+        main = "2-month Survival Distribution",
+        xlab = "obs_surv2",
+        ylab = "Frequency",
+        col = c("lightblue", "coral"))
+
+pie(table(support2$obs_surv2), 
+    main = "2-month Survival Proportion",
+    col = c("lightblue", "coral"))
+
+cat("\nTarget 2: 6-month Survival")
+
+# Frequency table
+cat("\nClass Distribution:\n")
+table(support2$obs_surv6)
+cat("\nClass Proportions:\n")
+prop.table(table(support2$obs_surv6))
+
+# Visualize class distribution
+par(mfrow = c(1, 2))
+barplot(table(support2$obs_surv6), 
+        main = "6-month Survival Distribution",
+        xlab = "obs_surv6",
+        ylab = "Frequency",
+        col = c("lightblue", "coral"))
+
+pie(table(support2$obs_surv6), 
+    main = "6-month Survival Proportion",
+    col = c("lightblue", "coral"))
+
+target_variables <- c("obs_surv2", "obs_surv6") # combined target variable made for later parts of eda
+```
+
+As expected in a critically ill cohort, 6‑month survival is lower than 2‑month survival, with a more balanced outcome distribution at 6 months and a modest survival majority at 2 months.
+
+### SUPPORT Model Analysis
+
+To contextualize the new models, the pre‑existing SUPPORT survival predictions at 2 and 6 months (*surv2m, surv6m*) are summarized and visualized.
+
+```{r}
+
+cat("\n=== SUPPORT MODEL ANALYSIS ===\n")
+cat("\nTarget 1: SUPPORT 2-month Survival")
+
+# Frequency table
+cat("\nDescriptive Statistics:\n")
+
+cat(sprintf("Mean: %.3f\n", mean(support2$surv2m, na.rm = TRUE)))
+cat(sprintf("Median: %.3f\n",median(support2$surv2m, na.rm = TRUE)))
+cat(sprintf("SD: %.3f\n",sd(support2$surv2m, na.rm = TRUE)))
+cat(sprintf("Min: %.3f\n",min(support2$surv2m, na.rm = TRUE)))
+cat(sprintf("Max: %.3f\n",max(support2$surv2m, na.rm = TRUE)))
+
+# Visualize class distribution
+par(mfrow = c(1, 2))
+hist(support2$surv2m, 
+        main = "SUPPORT 2-month Survival Distribution",
+        xlab = "surv2m",
+        ylab = "Frequency",
+        col = c("lightblue", "coral"),
+        breaks = 20,
+        cex.main = 0.8)
+
+boxplot(support2$surv2m, 
+        main = "SUPPORT 2-month Survival Proportion",
+        col = "lightgreen",
+        cex.main = 0.8)
+
+cat("\nTarget 2: SUPPORT 6-month Survival")
+
+# Frequency table
+cat("\nDescriptive Statistics::\n")
+cat(sprintf("Mean: %.3f\n", mean(support2$surv6m, na.rm = TRUE)))
+cat(sprintf("Median: %.3f\n",median(support2$surv6m, na.rm = TRUE)))
+cat(sprintf("SD: %.3f\n",sd(support2$surv6m, na.rm = TRUE)))
+cat(sprintf("Min: %.3f\n",min(support2$surv6m, na.rm = TRUE)))
+cat(sprintf("Max: %.3f\n",max(support2$surv6m, na.rm = TRUE)))
+
+# Visualize class distribution
+par(mfrow = c(1, 2))
+hist(support2$surv6m, 
+        main = "SUPPORT 6-month Survival Distribution",
+        xlab = "surv6m",
+        ylab = "Frequency",
+        col = c("lightblue", "coral"),
+        breaks = 20,
+        cex.main = 0.8)
+
+boxplot(support2$surv6m, 
+        main = "SUPPORT 6-month Survival Proportion",
+        col = "lightgreen",
+        cex.main = 0.8)
+
+support_models <- c("surv2m", "surv6m") # combined target variable made for later parts of eda
+```
+
+Both SUPPORT predictions display a bimodal pattern with a substantial mass near zero, representing patients with very poor prognosis, and a second mode in the higher‑survival range.
+At 2 months, predicted survival frequently peaks around 0.8, whereas 6‑month predictions are more dispersed with a peak between 0.6 and 0.8, reflecting increased uncertainty over longer horizons.
+
+### Predictor Variable Analysis
+
+#### Numeric Variable Analysis
+
+Numeric predictors are first identified and then summarized using histograms, boxplots, and descriptive statistics to assess central tendency, spread, skewness, and potential outliers.
+
+```{r}
+
+cat("\n=== NUMERIC VARIABLES ANALYSIS ===\n")
+numeric_vars <- setdiff(names(support2)[sapply(support2, is.numeric)], c(target_variables, support_models)) #removes targets and support models from EDA
+cat("Numeric variables found:", paste(numeric_vars, collapse = ", "), "\n")
+
+```
+
+Because *diabetes* and *dementia* are binary indicators, they are treated as categorical variables for subsequent analyses and removed from the numeric list.
+Several count‑ and scale‑based variables (e.g., *num.co, adlp, adls, adlsc*) represent ordered constructs and may later be converted to ordinal factors, but they are initially explored as numeric.
+
+```{r}
+
+cat_vars <- c("diabetes", "dementia")
+numeric_vars <- setdiff(
+  names(support2)[sapply(support2, is.numeric)], 
+  c(support_models, cat_vars)
+  ) #removes categorical vars and support models from EDA
+cat("Numeric variables found:", paste(numeric_vars, collapse = ", "), "\n")
+
+```
+
+```{r}
+# Distribution plots for numeric variables
+# And box plots to identify outliers
+
+par(mar = c(2, 2, 2, 1))
+par(mfrow = c(5, 2))
+for (var in numeric_vars) {
+  hist(support2[[var]], 
+       main = paste("Distribution of", var),
+       xlab = var,
+       col = "lightblue",
+       breaks = 30)
+
+  boxplot(support2[[var]], 
+          main = var,
+          col = "lightgreen")
+}
+
+# Detailed statistics for numeric variables
+cat("\nDetailed Statistics for Numeric Variables:\n")
+for(var in numeric_vars) {
+  cat(sprintf("\n--- %s ---\n", var))
+  cat(sprintf("Mean: %.2f\n", mean(support2[[var]], na.rm = TRUE)))
+  cat(sprintf("Median: %.2f\n", median(support2[[var]], na.rm = TRUE)))
+  cat(sprintf("SD: %.2f\n", sd(support2[[var]], na.rm = TRUE)))
+  cat(sprintf("Min: %.2f\n", min(support2[[var]], na.rm = TRUE)))
+  cat(sprintf("Max: %.2f\n", max(support2[[var]], na.rm = TRUE)))
+  cat(sprintf("IQR: %.2f\n", IQR(support2[[var]], na.rm = TRUE)))
+  
+  # Check for outliers using IQR method
+  Q1 <- quantile(support2[[var]], 0.25, na.rm = TRUE)
+  Q3 <- quantile(support2[[var]], 0.75, na.rm = TRUE)
+  IQR_val <- Q3 - Q1
+  outliers <- sum(support2[[var]] < (Q1 - 1.5 * IQR_val) | 
+                    support2[[var]] > (Q3 + 1.5 * IQR_val), na.rm = TRUE)
+  cat(sprintf("Number of outliers (IQR method): %d (%.2f%%)\n", 
+              outliers, 100 * outliers / nrow(support2)))
+}
+
+```
+
+Distributions reveal that many physiologic and laboratory variables are right‑skewed, including *num.co, scoma, avtisst, hday, wblc, pafi, alb, bili, crea, glucose, bun, urine,* and the ADL measures, while *meanbp* appears multimodal and *age, resp,* and *temp* show mild skewness.
+Most outliers are clinically plausible for a critically ill ICU population and are therefore retained for modeling.
+
+#### Categorical Variable Analysis
+
+Categorical variables are summarized using frequency tables, proportions, and bar plots to characterize the patient population and inform later modeling decisions.
+
+```{r}
+cat("\n=== CATEGORICAL VARIABLES ANALYSIS ===\n")
+categorical_vars <- setdiff(
+  names(support2)[sapply(support2, function(x) is.factor(x) || is.character(x))],
+  target_variables
+  )
+categorical_vars <- c(categorical_vars, cat_vars)
+cat("Categorical variables found:", paste(categorical_vars, collapse = ", "), "\n")
+
+# Frequency tables and bar plots
+par(mar = c(2, 2, 2, 1))
+par(mfrow = c(3, 3))
+for(var in categorical_vars) {
+  cat(sprintf("\nFrequency table for %s:\n", var))
+  print(table(support2[[var]]))
+  cat(sprintf("Proportions for %s:\n", var))
+  print(prop.table(table(support2[[var]])))
+  
+  # Bar plot
+  barplot(table(support2[[var]]), 
+          main = paste("Distribution of", var),
+          col = rainbow(length(unique(support2[[var]]))))
+}
+
+```
+
+The cohort contains slightly more males than females, is predominantly White, and is dominated by acute renal failure or multiorgan failure with sepsis among disease groups, with smaller representation of cirrhosis and colon cancer.
+Most patients do not have diabetes or dementia, and the majority lack a history of cancer, although metastatic disease remains clinically important among those with malignancy.
+
+### Relationship between Predictors and Target
+
+To explore potential predictors of short‑ and medium‑term mortality, numeric variables are compared across survival groups using boxplots, and categorical variables are cross‑tabulated with the 2‑ and 6‑month outcomes.
+
+```{r}
+cat("\n=== RELATIONSHIP BETWEEN PREDICTORS AND TARGETS ===\n")
+
+# Both target variables 
+# For numeric predictors vs binary target
+
+par(mfrow = c(3, 2), mar = c(4, 4, 2.5, 1))
+for(var in numeric_vars) {
+  # 2-month survival plot
+  boxplot(support2[[var]] ~ support2$obs_surv2,
+          main = paste(var, "by 2-month survival"),
+          col = c("lightblue", "coral"),
+          ylab = var,
+          xlab = "obs_surv2",
+          cex.main = 0.8)
+  
+  # 6-month survival plot
+  boxplot(support2[[var]] ~ support2$obs_surv6,
+          main = paste(var, "by 6-month survival"),
+          col = c("lightgreen", "pink"),
+          ylab = var,
+          xlab = "obs_surv6",
+          cex.main = 0.8)
+}
+
+# For categorical predictors vs binary target
+for(var in categorical_vars[!categorical_vars %in% c("obs_surv2", "obs_surv6")]) {
+  
+  cat(sprintf("\n=== Variable: %s ===\n", var))
+  
+  # 2-month survival
+  cat("\n--- 2-month survival ---\n")
+  tbl2 <- table(support2[[var]], support2$obs_surv2)
+  print(tbl2)
+  cat("\nProportions (row-wise):\n")
+  print(prop.table(tbl2, margin = 1))
+  
+  # 6-month survival
+  cat("\n--- 6-month survival ---\n")
+  tbl6 <- table(support2[[var]], support2$obs_surv6)
+  print(tbl6)
+  cat("\nProportions (row-wise):\n")
+  print(prop.table(tbl6, margin = 1))
+}
+
+```
+
+Visual inspection suggests that higher coma scores (*scoma*), greater severity (*avtisst*), and certain diagnostic categories (e.g., coma, cancer, multiorgan failure) are associated with lower survival at both time points, whereas age and comorbidity burden show more modest gradients.
+ADL measures display an inverse pattern relative to the data dictionary description, with higher values appearing more common in non‑survivors, indicating that the scale is likely coded such that higher scores reflect greater dependence.
+
+#### Note on ADL variables
+
+The data dictionary reports that higher ADL scores indicate better survival, but EDA shows that non‑survivors tend to have higher *adlp, adls,* and *adlsc* values than survivors.
+This pattern is consistent with traditional ADL instruments if the coding is reversed, with 0 indicating independence and higher scores indicating increasing dependence, particularly given that surrogate‑reported ADLs capture more severe impairment than patient‑reported scores.
+The analysis therefore proceeds under the assumption that lower ADL scores represent greater independence and higher scores greater dependence, attributing the discrepancy to documentation or coding differences.
+
+### Correlation Analysis
+
+Finally, correlations among numeric predictors are examined to identify highly collinear pairs that may require exclusion or feature engineering prior to modeling.
+
+```{r}
+if(length(numeric_vars) > 1) {
+  cat("\n=== CORRELATION ANALYSIS ===\n")
+  
+  # Calculate correlation matrix
+  cor_matrix <- cor(support2[, numeric_vars], use = "complete.obs")
+  print(round(cor_matrix, 3))
+  
+  # Visualize correlation matrix
+  par(mfrow = c(1, 1))
+  corrplot(cor_matrix,
+         method = "color",
+         type = "upper",
+         order = "hclust",
+         tl.cex = 0.8,
+         tl.col = "black")
+  
+  # Identify highly correlated pairs
+  cat("\nHighly correlated variable pairs (|r| > 0.6):\n")
+  high_cor <- which(abs(cor_matrix) > 0.6 & abs(cor_matrix) < 1, arr.ind = TRUE)
+  if(nrow(high_cor) > 0) {
+    for(i in 1:nrow(high_cor)) {
+      var1 <- rownames(cor_matrix)[high_cor[i, 1]]
+      var2 <- colnames(cor_matrix)[high_cor[i, 2]]
+      cor_val <- cor_matrix[high_cor[i, 1], high_cor[i, 2]]
+      cat(sprintf("  %s <-> %s: %.3f\n", var1, var2, cor_val))
+    }
+    cat("\nNote: Consider removing one variable from highly correlated pairs\n")
+  } else {
+    cat("No highly correlated pairs found.\n")
+  }
+}
+
+```
+
+Strong correlations are observed between the physician survival estimates (*prg2m, prg6m*) and between the surrogate‑calibrated ADL scores (*adls, adlsc*), leading to retention of *adlsc* and removal of *adls* and later *adlp* due to missingness and redundancy.
+Blood urea nitrogen and creatinine are also highly correlated, motivating the later construction of a BUN:creatinine ratio in the preprocessing step to reduce multicollinearity and align with clinical practice.
+
+```{r}
+
+support2 <- support2[, c("age","sex","dzgroup","dzclass","num.co","edu","income","scoma","avtisst","race","surv2m","surv6m","hday","diabetes","dementia","ca","meanbp","wblc","hrt","resp","temp","pafi","alb","bili","crea","sod","ph","glucose","bun","urine","adlsc","prg2m", "prg6m", "obs_surv2","obs_surv6")]
+
+```
+
+### EDA Summary
+
+Overall, the EDA highlights four key issues that shape the modeling strategy: substantial but clinically interpretable missingness, skewed and occasionally multimodal predictor distributions, strong and clinically plausible associations between some predictors and survival, and a small set of highly correlated variables requiring careful selection or transformation.
+
+## 4. Data Preprocessing
+
+Guided by the EDA findings, the dataset was preprocessed to ensure consistent encoding of categorical variables, appropriate handling of missing data, and creation of clinically meaningful derived features before model fitting.
+
+### Data Type Conversion
+
+Categorical predictors stored as character or numeric codes are recast as factors with appropriate levels and labels to support downstream modeling and interpretation.
+Income and race fields with blank strings are recoded to missing and then treated as categorical, while binary indicators for diabetes and dementia are explicitly labeled “No” and “Yes.” The number of comorbidities is grouped into clinically interpretable categories, and the surrogate‑calibrated ADL score (*adlsc*) is binned into ordered levels reflecting increasing dependence.
+
+```{r}
+
+support2$sex <- factor(support2$sex)
+
+support2$dzgroup <- factor(support2$dzgroup)
+support2$dzclass <- factor(support2$dzclass)
+
+support2$income <- factor(ifelse(trimws(support2$income) == "", NA, support2$income)) #recode "" to NA
+
+support2$race <- factor(ifelse(trimws(support2$race) == "", NA, support2$race)) #recode "" to NA
+
+support2$diabetes <- factor(support2$diabetes,
+                            levels = c(0, 1),
+                            labels = c("No", "Yes"))
+
+support2$dementia <- factor(support2$dementia,
+                            levels = c(0, 1),
+                            labels = c("No", "Yes"))
+
+support2$ca <- factor(support2$ca)
+
+support2$num.co_cat <- cut(
+    support2$num.co,
+    breaks = c(-Inf, 0, 2, 4, Inf),
+    labels = c("0", "1-2", "3-4", "5+"),
+    right = TRUE
+  )
+support2$num.co_cat <- factor(support2$num.co_cat, ordered = FALSE)
+
+support2$adlsc_cat <- cut(
+  support2$adlsc,
+  breaks = c(-0.01, 1, 2, 3, 4, 5, 6, 7, 8),
+  labels = c("0","1","2","3","4","5","6","7"),
+  right = FALSE,
+  include.lowest = TRUE
+)
+support2$adlsc_cat <- factor(support2$adlsc_cat)
+
+str(support2)
+
+```
+
+### Verify and Encode Any Remaining Categorical Variables
+
+A brief check confirms that all intended categorical variables, including the survival outcomes, are encoded as factors with the expected levels.
+
+```{r}
+cat("\n=== VERIFY CATEGORICAL VARIABLE ENCODING ===\n")
+
+cat("Checking if all categorical variables are properly encoded as factors...\n")
+for(var in categorical_vars) {
+  if(!is.factor(support2[[var]])) {
+    support2[[var]] <- as.factor(support2[[var]])
+    cat(sprintf("Converted %s to factor\n", var))
+  }
+}
+
+# Verify target variable is a factor with proper levels
+if(!is.factor(support2$obs_surv2)) {
+  support2$obs_surv2 <- as.factor(support2$obs_surv2)
+  cat(sprintf("Converted target variable '%s' to factor\n", "obs_surv2"))
+}
+
+if(!is.factor(support2$obs_surv6)) {
+  support2$obs_surv6 <- as.factor(support2$obs_surv6)
+  cat(sprintf("Converted target variable '%s' to factor\n", "obs_surv6"))
+}
+
+cat(sprintf("\nTarget variable 1 '%s' levels: %s\n", 
+            "obs_surv2", 
+            paste(levels(support2$obs_surv2), collapse = ", ")))
+cat(sprintf("\nTarget variable 2 '%s' levels: %s\n", 
+            "obs_surv6", 
+            paste(levels(support2$obs_surv6), collapse = ", ")))
+cat("All categorical variables are properly encoded!\n")
+
+
+```
+
+### Handle Missing Values (Simple Drops)
+
+To prevent rare missingness from propagating through imputation, observations with missing values in a small subset of variables (\<0.01% missing) are dropped, and the remaining missingness is addressed in later imputation steps.
+The extent of missing data is re‑summarized after this minimal row removal.
+
+```{r}
+missing_count <- colSums(is.na(support2))
+missing_percent <- round(100 * missing_count / nrow(support2), 2)
+missing_df <- data.frame(
+  Variable = names(missing_count),
+  Missing_Count = missing_count,
+  Missing_Percent = missing_percent
+)
+print(missing_df)
+```
+
+```{r}
+
+support2 <- support2 %>% 
+  drop_na(scoma, surv2m, surv6m, meanbp, hrt, resp, temp, sod)
+
+missing_count <- colSums(is.na(support2))
+missing_percent <- round(100 * missing_count / nrow(support2), 2)
+missing_df <- data.frame(
+  Variable = names(missing_count),
+  Missing_Count = missing_count,
+  Missing_Percent = missing_percent
+)
+print(missing_df)
+```
+
+```{r}
+support2_clean <- support2
+```
+
+### Create Test and Train Set
+
+To ensure fair comparison across models and imputation strategies, a single stratified train–test split is created and then reused for all subsequent analyses.
+Stratification is based on the joint distribution of 2‑ and 6‑month survival, preserving the combination of outcomes across training and test sets and facilitating consistent model comparison across time horizons.
+
+```{r}
+
+cat("\n=== SPLITTING DATA INTO TRAIN AND TEST SETS ===\n")
+# Create a combined factor for stratification
+support2_clean$target_variables <- interaction(support2_clean$obs_surv2, 
+                                        support2_clean$obs_surv6, 
+                                        drop = TRUE)
+
+# Use stratified sampling to maintain class proportions
+set.seed(42)  # For reproducibility
+train_index <- createDataPartition(support2_clean$target_variables,
+                                   p = 0.75,  # 75% for training
+                                   list = FALSE,
+                                   times = 1)
+
+train_data <- support2_clean[train_index, ]
+test_data  <- support2_clean[-train_index, ]
+
+# Verify class distribution is maintained
+
+for (var in target_variables) {
+  cat(sprintf("\nClass distribution for %s in training set:\n", var))
+  print(prop.table(table(train_data[[var]])))
+  cat(sprintf("\nClass distribution for %s in test set:\n", var))
+  print(prop.table(table(test_data[[var]])))
+}
+```
+
+### Simple Imputation
+
+The first imputation strategy uses a combination of clinically motivated fixed values, grouped medians, and modes to replace missing values.
+Fixed values for key laboratory measures follow the dataset documentation and typical clinical norms, while remaining numeric variables are imputed using medians (with sex‑specific medians for *ph* and *glucose*), and *race* and *income* are imputed using their most frequent category.​
+
+```{r}
+
+support2_simple <- support2_clean
+
+#Fixed value imputation
+impute_values <- list(
+  alb   = 3.5,
+  pafi  = 333.3,
+  bili  = 1.01,
+  crea  = 1.01,
+  bun   = 6.51,
+  wblc  = 9,
+  urine = 2502,
+  prg2m = 0.5, #not included in the dataset homepage, 0.5 used for both predictions to 
+  prg6m = 0.5  #reduce bias
+)
+
+for (var in names(impute_values)) {
+  value <- impute_values[[var]]
+  
+  if (sum(is.na(support2_simple[[var]])) > 0) {
+    support2_simple[[var]][is.na(support2_simple[[var]])] <- value
+    cat(sprintf("Imputed %s with fixed value: %s\n", var, value))
+  }
+}
+
+#Grouped median imputation for ph and glucose by sex
+group_median_vars <- c("ph", "glucose")
+
+support2_simple <- support2_simple %>%
+  group_by(sex) %>%
+  mutate(across(all_of(group_median_vars),
+                ~ ifelse(is.na(.), median(., na.rm = TRUE), .))) %>%
+  ungroup()
+
+#Median imputation for avtsst and edu
+median_vars <- c("avtisst", "edu")
+
+for (var in median_vars) {
+  if (sum(is.na(support2_simple[[var]])) > 0) {
+    med_val <- median(support2_simple[[var]], na.rm = TRUE)
+    support2_simple[[var]][is.na(support2_simple[[var]])] <- med_val
+    cat(sprintf("Imputed %s with median: %.2f\n", var, med_val))
+  }
+}
+
+
+#Mode imputation for race and income
+mode_vars <- c("race", "income")
+
+for (var in mode_vars) {
+  if (sum(is.na(support2_simple[[var]])) > 0) {
+    mode_val <- names(sort(table(support2_simple[[var]]), decreasing = TRUE))[1]
+    support2_simple[[var]][is.na(support2_simple[[var]])] <- mode_val
+    cat(sprintf("Imputed %s with mode: %s\n", var, mode_val))
+  }
+}
+
+# Verify no missing values remain
+cat("Missing values after imputation:", sum(is.na(support2_simple)), "\n")
+```
+
+#### Simple - Feature Engineering
+
+Two derived features are then engineered to capture clinically meaningful patterns and reduce multicollinearity.
+A BUN:creatinine ratio summarizes renal function while addressing the strong correlation between *bun* and *crea*, and *pafi* is binned into severity categories based on widely used PaO22/FiO22 cut‑points (<https://litfl.com/pao2-fio2-ratio/>).
+
+```{r}
+support2_simple <- support2_simple %>%
+  mutate(
+    bun_crea_ratio = ifelse(crea > 0, bun / crea, NA_real_)
+  )
+
+support2_simple <- support2_simple %>%
+  mutate(
+    pafi_bin = case_when(
+      pafi > 300            ~ "normal",
+      pafi >= 200 & pafi <= 300 ~ "mild",
+      pafi >= 100 & pafi < 200   ~ "moderate",
+      pafi < 100             ~ "severe",
+      TRUE                   ~ NA_character_
+    )
+  )
+
+support2_simple$pafi_bin <- factor(support2_simple$pafi_bin)
+
+```
+
+#### Simple - Train and Test Split
+
+The same train–test indices are then applied to the simply imputed dataset to maintain consistency with the original split.
+
+```{r}
+
+# Split using the same indices
+train_data_simple <- support2_simple[train_index, ]
+test_data_simple  <- support2_simple[-train_index, ]
+
+```
+
+### Complex Imputation
+
+As a complementary approach, Multiple Imputation by Chained Equations (MICE) is applied to the cleaned dataset to obtain a fully imputed version that better preserves multivariate relationships between predictors.
+The imputation model includes both outcomes and a broad set of demographic, clinical, and laboratory predictors, and a single completed dataset (m = 1) is extracted for subsequent modeling given time constraints.
+
+```{r MICE, cache=TRUE}
+
+support2_complex <- support2_clean
+
+# Variables to include in MICE (predictors + outcomes)
+cols_for_mice <- c(
+  "obs_surv2", "obs_surv6",
+  "age", "sex", "dzgroup", "dzclass", "num.co", "edu",
+  "income", "scoma", "avtisst", "race", "hday", "diabetes",
+  "dementia", "ca", "meanbp", "wblc", "hrt", "resp", "temp",
+  "alb", "bili", "sod", "ph", "glucose", "urine",
+  "bun", "crea", "pafi", "adlsc",
+  "prg2m", "prg6m"
+)
+
+cols_for_mice <- intersect(cols_for_mice, names(support2_complex))
+mice_data <- support2_complex[, cols_for_mice]
+
+# Ensure outcomes are factors
+mice_data$obs_surv2 <- as.factor(mice_data$obs_surv2)
+mice_data$obs_surv6 <- as.factor(mice_data$obs_surv6)
+
+# Run MICE once on the full modeling dataset
+set.seed(42)
+mice_fit <- mice::mice(
+  mice_data,
+  m = 1,
+  maxit = 20
+)
+
+mice_complete <- mice::complete(mice_fit, 1)
+
+cat("Total missing after MICE:", sum(is.na(mice_complete)), "\n")
+
+# Put imputed variables back
+support2_complex[, cols_for_mice] <- mice_complete
+```
+
+#### Complex - Feature Engineering
+
+The same feature engineering steps used in the simple imputation pipeline are applied to the MICE‑imputed dataset, ensuring comparable predictor structures across imputation strategies.
+The existing train–test indices are reused to create parallel training and test sets for complex imputation.
+
+```{r}
+support2_complex <- support2_complex %>%
+  mutate(
+    bun_crea_ratio = ifelse(crea > 0, bun / crea, NA_real_)
+  )
+
+support2_complex <- support2_complex %>%
+  mutate(
+    pafi_bin = case_when(
+      pafi > 300            ~ "normal",
+      pafi >= 200 & pafi <= 300 ~ "mild",
+      pafi >= 100 & pafi < 200   ~ "moderate",
+      pafi < 100             ~ "severe",
+      TRUE                   ~ NA_character_
+    )
+  )
+
+support2_complex$pafi_bin <- factor(support2_complex$pafi_bin)
+
+```
+
+#### Complex - Train and Test Split
+
+```{r}
+
+# Split using the same indices
+train_data_complex <- support2_complex[train_index, ]
+test_data_complex  <- support2_complex[-train_index, ]
+
+```
+
+#### Imputation lists
+
+To simplify downstream modeling, the imputed datasets are stored in a structured list separating simple and complex strategies and their corresponding train and test subsets.
+
+```{r}
+
+imputations <- list(
+  simple = list(train = train_data_simple,  test = test_data_simple),
+  complex = list(train = train_data_complex, test = test_data_complex)
+)
+```
+
+### Define Predictor Variables
+
+Three predictor sets are defined to support different modeling scenarios and to assess the incremental value of physician survival estimates.
+The base set includes only baseline demographic, diagnostic, physiologic, and functional measures, while extended sets add *prg2m* for 2‑month models and *prg6m* for 6‑month models, respectively.
+
+```{r}
+
+predictor_vars <- c( "age", "sex", "dzgroup", "dzclass", "num.co_cat", "edu",
+                     "income", "scoma", "avtisst", "race", "hday", "diabetes",
+                     "dementia", "ca", "meanbp", "wblc", "hrt", "resp", "temp",
+                     "alb", "bili", "sod", "ph", "glucose", "urine",
+                     "bun_crea_ratio", "pafi_bin", "adlsc_cat"
+                     )
+
+predictor_vars_prg2m <- c( "age", "sex", "dzgroup", "dzclass", "num.co_cat", "edu",
+                     "income", "scoma", "avtisst", "race", "hday", "diabetes",
+                     "dementia", "ca", "meanbp", "wblc", "hrt", "resp", "temp",
+                     "alb", "bili", "sod", "ph", "glucose", "urine",
+                     "bun_crea_ratio", "pafi_bin", "adlsc_cat", "prg2m"
+                     )
+
+predictor_vars_prg6m <- c( "age", "sex", "dzgroup", "dzclass", "num.co_cat", "edu",
+                     "income", "scoma", "avtisst", "race", "hday", "diabetes",
+                     "dementia", "ca", "meanbp", "wblc", "hrt", "resp", "temp",
+                     "alb", "bili", "sod", "ph", "glucose", "urine",
+                     "bun_crea_ratio", "pafi_bin", "adlsc_cat", "prg6m"
+                     )
+
+predictor_sets <- list(
+  base = predictor_vars,
+  prg2m = predictor_vars_prg2m,
+  prg6m = predictor_vars_prg6m
+)
+```
+
+### Note on Outliers and Scaling
+
+Outliers in key predictors were reviewed during EDA and found to be clinically plausible for a critically ill ICU population, so no additional trimming or winsorization is applied.
+Because the primary models (logistic regression, LASSO, random forest, gradient boosting) are either scale‑invariant or internally standardized, external feature scaling is not performed.
+
+## 5. Model Building
+
+4 models will be built:
+
+-   **Logistic regression**: transparent baseline, easy interpretation.
+
+-   **Lasso logistic regression**: handles correlated predictors, does variable selection.
+
+-   **Random forest**: strong nonlinear, interaction‑capable benchmark.
+
+-   **Gradient boosting**: often best performance in structured tabular data.
+
+These four supervised learning models are developed and compared using a common train–test split and repeated cross‑validation: logistic regression, LASSO logistic regression, random forest, and gradient boosting.
+These models collectively provide a transparent baseline, penalized regression with embedded variable selection, and two non‑linear tree‑based approaches capable of capturing complex interactions in tabular clinical data.
+
+To satisfy the requirement of evaluating multiple models and at least two cross‑validated approaches while remaining computationally feasible, imputation strategies are compared first using logistic regression and the better‑performing approach is then carried forward to LASSO, random forest, and gradient boosting.
+The extended predictor sets including physician survival estimates (*prg2m, prg6m*) are only applied to the best‑performing model to assess the incremental contribution of physician judgment without incurring prohibitive run times.
+
+### Model Prep
+
+#### Cross Validation
+
+All models use the same repeated 10‑fold cross‑validation scheme, with ROC as the primary optimization metric, to obtain robust internal performance estimates and ensure fair comparison across algorithms.
+
+```{r}
+
+ctrl <- trainControl(
+  method = "repeatedcv",      # Cross-validation with repeats (slight improvement)
+  number = 10,                # 10 folds
+  repeats = 5,                # 5 repeats
+  summaryFunction = twoClassSummary,  # For binary classification metrics
+  classProbs = TRUE,          # Need class probabilities for ROC
+  savePredictions = "final",  # Save predictions for analysis
+  verboseIter = FALSE,         # Set to TRUE to see progress
+  allowParallel = FALSE  
+)
+```
+
+#### Model Results
+
+A unified results table is initialized to capture key evaluation metrics for each model, imputation strategy, and outcome (2‑ and 6‑month survival), including cross‑validated training ROC, test accuracy, sensitivity, specificity, AUC, and training time.
+
+The roc_list object is used to store ROC curves for each model–imputation–outcome combination.
+This structure was originally introduced to enable formal pairwise AUC comparison using tests such as DeLong’s method (for example, comparing each model to the SUPPORT benchmark or to the best‑performing model).
+If additional computation time were available, these stored ROC objects could be passed to functions like roc.test() to quantify whether observed differences in AUC between models are statistically meaningful, but in this report results are interpreted descriptively without inferential testing.
+
+```{r}
+
+# Initialize results storage
+# Create an empty data frame to store performance metrics for different models
+model_results <- data.frame(
+  Imputation = character(),         # "simple" or "complex"
+  Target = character(),              # obssurv2 or obssurv6
+  Model = character(),      # Model name (e.g., Logistic Regression, Random Forest)
+  Accuracy_Train = numeric(),        # Accuracy on the training dataset
+  Accuracy_Test = numeric(),         # Accuracy on the test dataset
+  Sensitivity_Test = numeric(),      # True positive rate on the test set
+  Specificity_Test = numeric(),      # True negative rate on the test set
+  AUC_Test = numeric(),              # Area Under the ROC Curve on the test set
+  Training_Time = numeric(),         # Time taken to train the model (in seconds)
+  stringsAsFactors = FALSE           # Keep text columns as character, not factors
+)
+
+# Store ROC objects for later significance tests
+roc_list <- list()
+```
+
+### Model 1: Logistic Regression
+
+Logistic regression serves as an interpretable baseline model and is fitted under both imputation strategies and for both survival horizons using the base predictor set.
+Test‑set performance across imputation methods is then compared to select the imputation strategy used in subsequent models.
+
+```{r m1, cache=TRUE}
+for (imp_name in names(imputations)) {
+  for (target_var in target_variables) {
+    cat("\n\n============================\n")
+    cat("LOGISTIC REGRESSION -", 
+        "Imputation:", imp_name, 
+        "| Predictor set: predictor_vars",
+        "| Target:", target_var, "\n")
+    cat("============================\n")
+    
+    train_data <- imputations[[imp_name]]$train
+    test_data  <- imputations[[imp_name]]$test
+    
+    formula <- as.formula(
+      paste(target_var, "~", paste(predictor_vars, collapse = " + "))
+    )
+    
+    start_time <- Sys.time()
+    set.seed(42)
+    
+    log_model <- train(
+      formula,
+      data   = train_data,
+      method = "glm",
+      family = "binomial",
+      trControl = ctrl,
+      metric    = "ROC"
+    )
+    
+    end_time  <- Sys.time()
+    log_time  <- as.numeric(difftime(end_time, start_time, units = "secs"))
+    
+    log_pred_test      <- predict(log_model, test_data)
+    log_pred_test_prob <- predict(log_model, test_data, type = "prob")
+    
+    log_cm_test <- confusionMatrix(
+      log_pred_test,
+      test_data[[target_var]],
+      positive = "Yes"
+    )
+    
+    log_roc_test <- roc(
+      test_data[[target_var]],
+      log_pred_test_prob[, "Yes"],
+      levels = c("No", "Yes")
+    )
+    log_auc_test <- as.numeric(auc(log_roc_test))
+    
+    model_name <- "M1: LogReg"
+    ps_name    <- "predictor_vars"
+    roc_key    <- paste0(model_name, "_", imp_name, "_", ps_name, "_", target_var)
+    roc_list[[roc_key]] <- list(
+      roc          = log_roc_test,
+      Model        = model_name,
+      Imputation   = imp_name,
+      PredictorSet = ps_name,
+      Target       = target_var
+    )
+    
+    model_results <- rbind(
+      model_results,
+      data.frame(
+        Imputation       = imp_name,
+        PredictorSet     = ps_name,
+        Target           = target_var,
+        Model            = model_name,
+        Accuracy_Train   = max(log_model$results$ROC),
+        Accuracy_Test    = as.numeric(log_cm_test$overall["Accuracy"]),
+        Sensitivity_Test = as.numeric(log_cm_test$byClass["Sensitivity"]),
+        Specificity_Test = as.numeric(log_cm_test$byClass["Specificity"]),
+        AUC_Test         = log_auc_test,
+        Training_Time    = log_time,
+        stringsAsFactors = FALSE
+      )
+    )
+  }
+}
+
+```
+
+#### Best imputation method:
+
+For both 2‑ and 6‑month survival, logistic regression with simple imputation yields slightly higher AUC and accuracy than with MICE‑based complex imputation, so the simple imputation pipeline is selected for all subsequent models.​
+
+### Model 2: Lasso Logistic Regression
+
+LASSO logistic regression extends the baseline model by applying an l1 penalty to perform variable selection and shrinkage, helping to manage multicollinearity and high‑dimensional predictor sets.
+This model is trained on the simply imputed dataset using the base predictor set for both outcomes, with internal centering and scaling.
+
+```{r m2, cache=TRUE}
+cl <- makePSOCKcluster(parallel::detectCores() - 1)
+registerDoParallel(cl)
+
+# Use simple imputation and predictor_vars only
+imp_name   <- "simple"
+ps_name    <- "predictor_vars"
+train_data <- imputations[[imp_name]]$train
+test_data  <- imputations[[imp_name]]$test
+
+for (target_var in target_variables) {
+  cat("\n\n============================\n")
+  cat("LASSO LOGISTIC REGRESSION -", 
+      "Imputation:", imp_name, 
+      "| Predictor set:", ps_name,
+      "| Target:", target_var, "\n")
+  cat("============================\n")
+  
+  # build formula for this target
+  formula <- as.formula(
+    paste(target_var, "~", paste(predictor_vars, collapse = " + "))
+  )
+  
+  # fit model
+  start_time <- Sys.time()
+  set.seed(42)
+  
+  lasso_model <- train(
+    formula,
+    data = train_data,
+    method = "glmnet",
+    family = "binomial",
+    trControl = ctrl,          # consider ctrl$allowParallel <- FALSE if glmnet is fussy
+    tuneLength = 30,
+    metric = "ROC",
+    preProcess = c("center", "scale")
+  )
+  
+  end_time <- Sys.time()
+  lasso_time <- as.numeric(difftime(end_time, start_time, units = "secs"))
+  
+  cat("Training complete!\n")
+  print(lasso_model)
+  
+  # Variable importance
+  cat("\nVariable Importance (Lasso):\n")
+  lasso_importance <- varImp(lasso_model)
+  print(lasso_importance)
+  
+  # Predictions
+  lasso_pred_test      <- predict(lasso_model, test_data)
+  lasso_pred_test_prob <- predict(lasso_model, test_data, type = "prob")
+  
+  # Evaluate
+  lasso_cm_test <- confusionMatrix(
+    lasso_pred_test,
+    test_data[[target_var]],
+    positive = "Yes"
+  )
+  cat("\nTest Set Performance:\n")
+  print(lasso_cm_test)
+  
+  lasso_roc_test <- roc(
+    test_data[[target_var]],
+    lasso_pred_test_prob[, "Yes"],
+    levels = c("No", "Yes")
+  )
+  lasso_auc_test <- as.numeric(auc(lasso_roc_test))
+  cat(sprintf("\nTest Set AUC: %.4f\n", lasso_auc_test))
+  
+  # Store ROC
+  model_name <- "M2: Lasso"
+  roc_key <- paste0(model_name, "_", imp_name, "_", ps_name, "_", target_var)
+  roc_list[[roc_key]] <- list(
+    roc          = lasso_roc_test,
+    Model        = model_name,
+    Imputation   = imp_name,
+    PredictorSet = ps_name,
+    Target       = target_var
+  )
+  
+  # Store results
+  model_results <- rbind(
+    model_results,
+    data.frame(
+      Imputation       = imp_name,
+      PredictorSet     = ps_name,
+      Target           = target_var,
+      Model            = model_name,
+      Accuracy_Train   = max(lasso_model$results$ROC),
+      Accuracy_Test    = as.numeric(lasso_cm_test$overall["Accuracy"]),
+      Sensitivity_Test = as.numeric(lasso_cm_test$byClass["Sensitivity"]),
+      Specificity_Test = as.numeric(lasso_cm_test$byClass["Specificity"]),
+      AUC_Test         = lasso_auc_test,
+      Training_Time    = lasso_time,
+      stringsAsFactors = FALSE
+    )
+  )
+}
+
+stopCluster(cl)
+registerDoSEQ()
+
+```
+
+### Model 3: Random Forest
+
+Random forest provides a flexible non‑linear benchmark that can capture complex interactions and handles mixed‑type predictors without extensive preprocessing.
+Using the simple imputation pipeline and base predictor set, a tuned random forest is fitted for each outcome, with a small grid over *mtry* and fixed values for the number of trees and tree size constraints.
+
+```{r m3, cache=TRUE}
+cl <- makePSOCKcluster(parallel::detectCores() - 1)
+registerDoParallel(cl)
+
+# Use simple imputation and predictor_vars only
+imp_name   <- "simple"
+ps_name    <- "predictor_vars"
+train_data <- imputations[[imp_name]]$train
+test_data  <- imputations[[imp_name]]$test
+
+for (target_var in target_variables) {
+  cat("\n\n============================\n")
+  cat("RANDOM FOREST -", 
+      "Imputation:", imp_name, 
+      "| Predictor set:", ps_name,
+      "| Target:", target_var, "\n")
+  cat("============================\n")
+  
+  # Build formula with predictor_vars
+  formula <- as.formula(
+    paste(target_var, "~", paste(predictor_vars, collapse = " + "))
+  )
+  
+  n_features <- length(predictor_vars)
+  
+  # mtry grid (smart tuning)
+  rf_grid <- expand.grid(
+    mtry = unique(pmax(2, round(c(sqrt(n_features), n_features/3, n_features/2))))
+  )
+  
+  # Train model
+  start_time <- Sys.time()
+  set.seed(42)
+  
+  rf_model <- train(
+    formula,
+    data = train_data,
+    method = "rf",
+    trControl = ctrl,
+    tuneGrid = rf_grid,
+    ntree = 300,
+    maxnodes = 30,
+    nodesize = 5,
+    importance = TRUE,
+    metric = "ROC"
+  )
+  
+  end_time <- Sys.time()
+  rf_time <- as.numeric(difftime(end_time, start_time, units = "secs"))
+  
+  cat("Training complete!\n")
+  print(rf_model)
+  
+  # Variable importance
+  cat("\nVariable Importance (Random Forest):\n")
+  rf_importance <- varImp(rf_model)
+  print(rf_importance)
+  
+  # Predictions
+  rf_pred_test      <- predict(rf_model, test_data)
+  rf_pred_test_prob <- predict(rf_model, test_data, type = "prob")
+  
+  # Evaluation
+  rf_cm_test <- confusionMatrix(
+    rf_pred_test,
+    test_data[[target_var]],
+    positive = "Yes"
+  )
+  rf_roc_test <- roc(
+    test_data[[target_var]],
+    rf_pred_test_prob[, "Yes"],
+    levels = c("No","Yes")
+  )
+  rf_auc_test <- as.numeric(auc(rf_roc_test))
+  
+  cat("\nTest Set Performance:\n")
+  print(rf_cm_test)
+  cat(sprintf("\nTest Set AUC: %.4f\n", rf_auc_test))
+  
+  # Store ROC
+  model_name <- "M3: RF"
+  roc_key <- paste0(model_name, "_", imp_name, "_", ps_name, "_", target_var)
+  roc_list[[roc_key]] <- list(
+    roc          = rf_roc_test,
+    Model        = model_name,
+    Imputation   = imp_name,
+    PredictorSet = ps_name,
+    Target       = target_var
+  )
+  
+  # Store results
+  model_results <- rbind(
+    model_results,
+    data.frame(
+      Imputation       = imp_name,
+      PredictorSet     = ps_name,
+      Target           = target_var,
+      Model            = model_name,
+      Accuracy_Train   = max(rf_model$results$ROC),
+      Accuracy_Test    = as.numeric(rf_cm_test$overall["Accuracy"]),
+      Sensitivity_Test = as.numeric(rf_cm_test$byClass["Sensitivity"]),
+      Specificity_Test = as.numeric(rf_cm_test$byClass["Specificity"]),
+      AUC_Test         = rf_auc_test,
+      Training_Time    = rf_time,
+      stringsAsFactors = FALSE
+    )
+  )
+}
+
+stopCluster(cl)
+registerDoSEQ()
+
+```
+
+### Model 4: Gradient Boosting
+
+Gradient boosting (GBM) is included as a high‑capacity ensemble model that often delivers strong performance in structured tabular data.
+Using the simple imputation and base predictor set, GBM models are tuned over a grid of tree counts, interaction depths, and learning rates for each outcome.
+
+```{r m4, cache=TRUE}
+cl <- makePSOCKcluster(parallel::detectCores() - 1)
+registerDoParallel(cl)
+
+# Use simple imputation and predictor_vars only
+imp_name   <- "simple"
+ps_name    <- "predictor_vars"
+train_data <- imputations[[imp_name]]$train
+test_data  <- imputations[[imp_name]]$test
+
+for (target_var in target_variables) {
+  cat("\n\n============================\n")
+  cat("GRADIENT BOOSTING -", 
+      "Imputation:", imp_name, 
+      "| Predictor set:", ps_name, 
+      "| Target:", target_var, "\n")
+  cat("============================\n")
+  
+  predictor_variables <- predictor_vars
+  
+  formula <- as.formula(
+    paste(target_var, "~", paste(predictor_variables, collapse = " + "))
+  )
+  
+  gbm_grid <- expand.grid(
+    n.trees = seq(100, 1000, by = 100),
+    interaction.depth = c(1, 3, 5),
+    shrinkage = c(0.01, 0.05, 0.1),
+    n.minobsinnode = 10
+  )
+  
+  start_time <- Sys.time()
+  set.seed(42)
+  
+  gbm_model <- train(
+    formula,
+    data = train_data,
+    method = "gbm",
+    trControl = ctrl,
+    tuneGrid = gbm_grid,
+    metric = "ROC",
+    verbose = FALSE
+  )
+  
+  end_time <- Sys.time()
+  gbm_time <- as.numeric(difftime(end_time, start_time, units = "secs"))
+  
+  cat("Training complete!\n")
+  print(gbm_model)
+  
+  # Variable importance
+  gbm_importance <- varImp(gbm_model)
+  print(gbm_importance)
+  
+  # Predictions
+  gbm_pred_test_prob <- predict(gbm_model, test_data, type = "prob")
+  gbm_pred_test      <- predict(gbm_model, test_data)
+  
+  # Evaluation
+  gbm_cm_test <- confusionMatrix(
+    gbm_pred_test,
+    test_data[[target_var]],
+    positive = "Yes"
+  )
+  gbm_roc_test <- roc(
+    test_data[[target_var]],
+    gbm_pred_test_prob[, "Yes"],
+    levels = c("No","Yes")
+  )
+  gbm_auc_test <- as.numeric(auc(gbm_roc_test))
+  
+  cat("\nTest Set Performance:\n")
+  print(gbm_cm_test)
+  cat(sprintf("\nTest Set AUC: %.4f\n", gbm_auc_test))
+  
+  # Store ROC
+  model_name <- "M4: GBM"
+  roc_key <- paste0(model_name, "_", imp_name, "_", ps_name, "_", target_var)
+  roc_list[[roc_key]] <- list(
+    roc          = gbm_roc_test,
+    Model        = model_name,
+    Imputation   = imp_name,
+    PredictorSet = ps_name,
+    Target       = target_var
+  )
+  
+  # Store results (use GBM metrics, not logistic ones)
+  model_results <- rbind(
+    model_results,
+    data.frame(
+      Imputation       = imp_name,
+      PredictorSet     = ps_name,
+      Target           = target_var,
+      Model            = model_name,
+      Accuracy_Train   = max(gbm_model$results$ROC),
+      Accuracy_Test    = as.numeric(gbm_cm_test$overall["Accuracy"]),
+      Sensitivity_Test = as.numeric(gbm_cm_test$byClass["Sensitivity"]),
+      Specificity_Test = as.numeric(gbm_cm_test$byClass["Specificity"]),
+      AUC_Test         = gbm_auc_test,
+      Training_Time    = gbm_time,
+      stringsAsFactors = FALSE
+    )
+  )
+}
+
+# Stop parallel
+stopCluster(cl)
+registerDoSEQ()
+
+```
+
+#### Best Model
+
+Because gradient boosting emerged as the best‑performing model based on test‑set AUC and accuracy at both time horizons, an additional set of GBM models was fitted to evaluate the incremental value of physician survival estimates.
+Specifically, for 2‑month survival, a GBM model including the base predictors plus prg2m was trained, and for 6‑month survival a corresponding GBM model including prg6m was estimated, using the same simple imputation pipeline, train–test split, and cross‑validation settings as the primary GBM models.
+
+To limit runtime while still assessing the added value of physician estimates, two streamlined gradient boosting models were fit as add‑on analyses.
+For 2‑month survival, a GBM model was retrained using the simple imputation pipeline, the same train–test split and cross‑validation framework, and an extended predictor set that included *prg2m* in addition to the original clinical and demographic variables.
+An analogous GBM model was then fit for 6‑month survival using *prg6m* alongside the base predictors, but with a reduced tuning grid and simplified 10‑fold cross‑validation (without repeats) to keep computational costs manageable.
+
+```{r GBM+prg2m, cache=TRUE}
+
+cat("\n\n=== ADD-ON: GBM WITH prg2m FOR 2-MONTH SURVIVAL ===\n")
+
+imp_name   <- "simple"
+ps_name    <- "prg2m"
+train_data <- imputations[[imp_name]]$train
+test_data  <- imputations[[imp_name]]$test
+
+target_var <- "obs_surv2"
+
+formula_gbm_prg2m <- as.formula(
+  paste(target_var, "~", paste(predictor_sets[[ps_name]], collapse = " + "))
+)
+
+# Lighter tuning grid to reduce runtime
+gbm_grid_prg2m <- expand.grid(
+  n.trees = c(100, 300),      # fewer trees
+  interaction.depth = 3,      # single moderate depth
+  shrinkage = 0.05,           # single learning rate
+  n.minobsinnode = 10
+)
+
+# Simpler CV: 10-fold, no repeats (do not change global ctrl)
+ctrl_light <- trainControl(
+  method = "cv",
+  number = 10,
+  summaryFunction = twoClassSummary,
+  classProbs = TRUE,
+  savePredictions = "final",
+  verboseIter = FALSE,
+  allowParallel = FALSE
+)
+
+start_time <- Sys.time()
+set.seed(42)
+
+gbm_prg2m_model <- train(
+  formula_gbm_prg2m,
+  data = train_data,
+  method = "gbm",
+  trControl = ctrl_light,
+  tuneGrid = gbm_grid_prg2m,
+  metric = "ROC",
+  verbose = FALSE
+)
+
+end_time <- Sys.time()
+gbm_prg2m_time <- as.numeric(difftime(end_time, start_time, units = "secs"))
+
+gbm_prg2m_pred_prob <- predict(gbm_prg2m_model, test_data, type = "prob")
+gbm_prg2m_pred      <- predict(gbm_prg2m_model, test_data)
+
+gbm_prg2m_cm <- confusionMatrix(
+  gbm_prg2m_pred,
+  test_data[[target_var]],
+  positive = "Yes"
+)
+
+gbm_prg2m_roc <- roc(
+  test_data[[target_var]],
+  gbm_prg2m_pred_prob[, "Yes"],
+  levels = c("No","Yes")
+)
+gbm_prg2m_auc <- as.numeric(auc(gbm_prg2m_roc))
+
+cat("\nTest Set Performance (GBM + prg2m, 2-month):\n")
+print(gbm_prg2m_cm)
+cat(sprintf("Test AUC: %.4f\n", gbm_prg2m_auc))
+
+# Store in roc_list and model_results so comparison code still works
+model_name <- "M4: GBM + prg2m"
+roc_key <- paste0(model_name, "_", imp_name, "_", ps_name, "_", target_var)
+roc_list[[roc_key]] <- list(
+  roc          = gbm_prg2m_roc,
+  Model        = model_name,
+  Imputation   = imp_name,
+  PredictorSet = ps_name,
+  Target       = target_var
+)
+
+model_results <- rbind(
+  model_results,
+  data.frame(
+    Imputation       = imp_name,
+    PredictorSet     = ps_name,
+    Target           = target_var,
+    Model            = model_name,
+    Accuracy_Train   = max(gbm_prg2m_model$results$ROC),
+    Accuracy_Test    = as.numeric(gbm_prg2m_cm$overall["Accuracy"]),
+    Sensitivity_Test = as.numeric(gbm_prg2m_cm$byClass["Sensitivity"]),
+    Specificity_Test = as.numeric(gbm_prg2m_cm$byClass["Specificity"]),
+    AUC_Test         = gbm_prg2m_auc,
+    Training_Time    = gbm_prg2m_time,
+    stringsAsFactors = FALSE
+  )
+)
+
+```
+
+```{r GBMprg6m, cache=TRUE}
+
+cat("\n\n=== ADD-ON: GBM WITH prg6m FOR 6-MONTH SURVIVAL ===\n")
+
+imp_name   <- "simple"
+ps_name    <- "prg6m"
+train_data <- imputations[[imp_name]]$train
+test_data  <- imputations[[imp_name]]$test
+
+target_var <- "obs_surv6"
+
+formula_gbm_prg6m <- as.formula(
+  paste(target_var, "~", paste(predictor_sets[[ps_name]], collapse = " + "))
+)
+
+# Same lightweight grid
+gbm_grid_prg6m <- expand.grid(
+  n.trees = c(100, 300),
+  interaction.depth = 3,
+  shrinkage = 0.05,
+  n.minobsinnode = 10
+)
+
+# Reuse the same light CV setup
+ctrl_light <- trainControl(
+  method = "cv",
+  number = 10,
+  summaryFunction = twoClassSummary,
+  classProbs = TRUE,
+  savePredictions = "final",
+  verboseIter = FALSE,
+  allowParallel = FALSE
+)
+
+start_time <- Sys.time()
+set.seed(42)
+
+gbm_prg6m_model <- train(
+  formula_gbm_prg6m,
+  data = train_data,
+  method = "gbm",
+  trControl = ctrl_light,
+  tuneGrid = gbm_grid_prg6m,
+  metric = "ROC",
+  verbose = FALSE
+)
+
+end_time <- Sys.time()
+gbm_prg6m_time <- as.numeric(difftime(end_time, start_time, units = "secs"))
+
+gbm_prg6m_pred_prob <- predict(gbm_prg6m_model, test_data, type = "prob")
+gbm_prg6m_pred      <- predict(gbm_prg6m_model, test_data)
+
+gbm_prg6m_cm <- confusionMatrix(
+  gbm_prg6m_pred,
+  test_data[[target_var]],
+  positive = "Yes"
+)
+
+gbm_prg6m_roc <- roc(
+  test_data[[target_var]],
+  gbm_prg6m_pred_prob[, "Yes"],
+  levels = c("No","Yes")
+)
+gbm_prg6m_auc <- as.numeric(auc(gbm_prg6m_roc))
+
+cat("\nTest Set Performance (GBM + prg6m, 6-month):\n")
+print(gbm_prg6m_cm)
+cat(sprintf("Test AUC: %.4f\n", gbm_prg6m_auc))
+
+model_name <- "M4: GBM + prg6m"
+roc_key <- paste0(model_name, "_", imp_name, "_", ps_name, "_", target_var)
+roc_list[[roc_key]] <- list(
+  roc          = gbm_prg6m_roc,
+  Model        = model_name,
+  Imputation   = imp_name,
+  PredictorSet = ps_name,
+  Target       = target_var
+)
+
+model_results <- rbind(
+  model_results,
+  data.frame(
+    Imputation       = imp_name,
+    PredictorSet     = ps_name,
+    Target           = target_var,
+    Model            = model_name,
+    Accuracy_Train   = max(gbm_prg6m_model$results$ROC),
+    Accuracy_Test    = as.numeric(gbm_prg6m_cm$overall["Accuracy"]),
+    Sensitivity_Test = as.numeric(gbm_prg6m_cm$byClass["Sensitivity"]),
+    Specificity_Test = as.numeric(gbm_prg6m_cm$byClass["Specificity"]),
+    AUC_Test         = gbm_prg6m_auc,
+    Training_Time    = gbm_prg6m_time,
+    stringsAsFactors = FALSE
+  )
+)
+
+```
+
+### SUPPORT Models
+
+The original SUPPORT prognostic model is included as an external benchmark by evaluating its 2‑ and 6‑month survival predictions (*surv2m, surv6m*) on the same held‑out test set used for the machine learning models.
+For each time horizon, a ROC curve and AUC are computed, and the resulting AUC values are added to the consolidated results table to allow direct descriptive comparison with the newly trained models.
+No formal statistical tests are applied to compare AUCs; differences are interpreted descriptively due to computational constraints.
+
+```{r support models}
+
+ref_test <- imputations[["simple"]]$test
+
+## 2-month SUPPORT
+roc_support_2m <- roc(
+  response  = ref_test$obs_surv2,
+  predictor = ref_test$surv2m,
+  levels    = c("No","Yes")
+)
+auc_support_2m <- as.numeric(auc(roc_support_2m))
+
+## 6-month SUPPORT
+roc_support_6m <- roc(
+  response  = ref_test$obs_surv6,
+  predictor = ref_test$surv6m,
+  levels    = c("No","Yes")
+)
+auc_support_6m <- as.numeric(auc(roc_support_6m))
+
+# Store SUPPORT ROC objects in roc_list for plotting
+roc_list[["SUPPORT_surv2m_obssurv2"]] <- list(
+  roc          = roc_support_2m,
+  Model        = "SUPPORT (surv2m)",
+  Imputation   = NA,
+  PredictorSet = NA,
+  Target       = "obs_surv2"
+)
+
+roc_list[["SUPPORT_surv6m_obssurv6"]] <- list(
+  roc          = roc_support_6m,
+  Model        = "SUPPORT (surv6m)",
+  Imputation   = NA,
+  PredictorSet = NA,
+  Target       = "obs_surv6"
+)
+
+# Append SUPPORT benchmarks to the results table
+model_results <- rbind(
+  model_results,
+  data.frame(
+    Imputation       = NA,
+    PredictorSet     = NA,
+    Target           = "obs_surv2",
+    Model            = "SUPPORT (surv2m)",
+    Accuracy_Train   = NA,
+    Accuracy_Test    = NA,
+    Sensitivity_Test = NA,
+    Specificity_Test = NA,
+    AUC_Test         = auc_support_2m,
+    Training_Time    = NA,
+    stringsAsFactors = FALSE
+  ),
+  data.frame(
+    Imputation       = NA,
+    PredictorSet     = NA,
+    Target           = "obs_surv6",
+    Model            = "SUPPORT (surv6m)",
+    Accuracy_Train   = NA,
+    Accuracy_Test    = NA,
+    Sensitivity_Test = NA,
+    Specificity_Test = NA,
+    AUC_Test         = auc_support_6m,
+    Training_Time    = NA,
+    stringsAsFactors = FALSE
+  )
+)
+
+```
+
+## 6. Model Comparison and Selection
+
+The fitted models are compared using the consolidated results table, focusing on test‑set accuracy, AUC, sensitivity, specificity, and training time for each outcome and model.
+Visual summaries are then used to highlight relative performance across algorithms and to support selection of a single primary model for interpretation and benchmarking against the SUPPORT predictions.
+
+```{r}
+
+cat("\n\n########## MODEL COMPARISON ##########\n\n")
+
+#Display results table
+
+cat("=== MODEL PERFORMANCE COMPARISON ===\n") 
+print(model_results)
+
+#Sort by test accuracy
+
+model_results_sorted <- model_results[order(-model_results$Accuracy_Test), ] 
+cat("\nModels ranked by Test Accuracy:\n") 
+print(model_results_sorted)
+
+#Visualize model comparison
+
+#par(mfrow = c(2, 2))
+
+#1. Test Accuracy Comparison
+par(mar = c(10, 4, 4, 2))  
+barplot(model_results$Accuracy_Test,
+        names.arg = model_results$Model, las = 2, col = rainbow(nrow(model_results)), main = "Test Set Accuracy by Model", ylab = "Accuracy", ylim = c(0, 1))
+
+#2. AUC Comparison
+par(mar = c(10, 4, 4, 2))  
+barplot(as.numeric(model_results$AUC_Test),
+        names.arg = model_results$Model, las = 2, col = rainbow(nrow(model_results)), main = "Test Set AUC by Model", ylab = "AUC", ylim = c(0, 1))
+
+#3. Training Time Comparison
+par(mar = c(10, 4, 4, 2))  
+barplot(model_results$Training_Time,
+        names.arg = model_results$Model, las = 2, col = rainbow(nrow(model_results)), main = "Training Time by Model", ylab = "Time (seconds)")
+
+#4. Sensitivity Comparison
+par(mar = c(10, 4, 4, 2))  
+barplot(model_results$Sensitivity_Test,
+        names.arg = model_results$Model, las = 2,
+        col = rainbow(nrow(model_results)),
+        main = "Test Set Sensitivity by Model",
+        ylab = "Sensitivity",
+        ylim = c(0, 1))
+
+
+```
+
+```{r}
+# 5. ROC Curves Comparison
+
+cat("\n=== ROC CURVE PANELS BY OUTCOME ===\n")
+
+# Helper to plot ROC panel for a given target
+plot_roc_panel <- function(target_name, support_key, main_title) {
+  # Subset results for this target (exclude rows without AUC)
+  df_t <- subset(model_results, Target == target_name & !is.na(AUC_Test))
+  
+  # Exclude SUPPORT rows when ranking ML models
+  df_ml <- subset(df_t, !grepl("^SUPPORT", Model))
+  
+  if (nrow(df_ml) == 0) {
+    warning(sprintf("No ML models found for target '%s'; skipping panel.", target_name))
+    return(invisible(NULL))
+  }
+  
+  # Select top 3 models by AUC
+  top_ml <- head(df_ml[order(-df_ml$AUC_Test), ], 3)
+  
+  # Get SUPPORT ROC object
+  if (!support_key %in% names(roc_list)) {
+    stop(sprintf("Support ROC key '%s' not found in roc_list.", support_key))
+  }
+  roc_support <- roc_list[[support_key]]$roc
+  
+  # Open plot and draw SUPPORT curve
+  plot(
+    roc_support,
+    col = "black",
+    lwd = 2,
+    main = main_title,
+    legacy.axes = TRUE
+  )
+  
+  # Colors for up to 3 top ML models
+  ml_cols <- c("blue", "red", "green")
+  
+  # Add ROC for each top ML model
+  for (i in seq_len(nrow(top_ml))) {
+    m  <- top_ml$Model[i]
+    im <- top_ml$Imputation[i]
+    ps <- top_ml$PredictorSet[i]
+    
+    key <- paste0(m, "_", im, "_", ps, "_", target_name)
+    if (!key %in% names(roc_list)) {
+      warning(sprintf("ROC object for key '%s' not found in roc_list; skipping.", key))
+      next
+    }
+    
+    roc_obj <- roc_list[[key]]$roc
+    plot(roc_obj, col = ml_cols[i], lwd = 2, add = TRUE)
+  }
+  
+  # Build legend labels
+  support_idx <- which(grepl("^SUPPORT", df_t$Model))
+  if (length(support_idx) == 0) {
+    warning(sprintf("No SUPPORT row found for target '%s' in model_results.", target_name))
+    support_label <- "SUPPORT"
+  } else {
+    support_label <- sprintf("SUPPORT (AUC = %.2f)", df_t$AUC_Test[support_idx[1]])
+  }
+  
+  legend_labels <- c(support_label)
+  legend_cols   <- c("black")
+  
+  for (i in seq_len(nrow(top_ml))) {
+    legend_labels <- c(
+      legend_labels,
+      sprintf("%s (AUC = %.2f)", top_ml$Model[i], top_ml$AUC_Test[i])
+    )
+    legend_cols <- c(legend_cols, ml_cols[i])
+  }
+  
+  legend(
+    "bottomright",
+    legend = legend_labels,
+    col    = legend_cols,
+    lwd    = 2,
+    cex    = 0.7
+  )
+}
+
+# Two-panel layout: 2-month and 6-month survival
+par(mfrow = c(1, 2))
+
+# 2-month survival panel
+plot_roc_panel(
+  target_name = "obs_surv2",
+  support_key = "SUPPORT_surv2m_obssurv2",
+  main_title  = "ROC Curves – 2-month Survival"
+)
+
+# 6-month survival panel
+plot_roc_panel(
+  target_name = "obs_surv6",
+  support_key = "SUPPORT_surv6m_obssurv6",
+  main_title  = "ROC Curves – 6-month Survival"
+)
+
+```
+
+```{r}
+#Select best model based on AUC
+
+best_model_idx <- which.max(model_results$AUC_Test)
+best_model_name <- model_results$Model[best_model_idx] 
+cat(sprintf("\n=== BEST MODEL: %s ===\n", best_model_name)) 
+cat(sprintf("Test Accuracy: %.4f\n", model_results$Accuracy_Test[best_model_idx]))
+cat(sprintf("Test Sensitivity: %.4f\n", model_results$Sensitivity_Test[best_model_idx])) 
+cat(sprintf("Test Specificity: %.4f\n", model_results$Specificity_Test[best_model_idx]))
+cat(sprintf("Test AUC: %.4f\n", model_results$AUC_Test[best_model_idx]))
+```
+
+### Discussion
+
+Gradient boosting with physician survival estimates provided the strongest overall discrimination and accuracy at both 2‑ and 6‑month horizons, outperforming logistic regression, LASSO, and random forest as well as the original SUPPORT scores.
+Incorporating *prg2m* and *prg6m* into the GBM models yielded meaningful gains in AUC, test accuracy, and sensitivity compared with GBM models using clinical predictors alone, supporting the value of physician judgement in short‑term mortality prediction.​
+
+#### Overall model performance
+
+Across all models, performance was generally higher for 2‑month than 6‑month survival, with modest trade‑offs between sensitivity and specificity.
+For 2‑month survival, GBM with base predictors achieved test accuracy of 0.77 and AUC of 0.81, while logistic and LASSO regression were close behind with slightly lower AUCs but similar accuracies; random forest performed slightly worse on both metrics.
+For 6‑month survival, GBM again led the base‑predictor models (AUC ≈ 0.81), with logistic and LASSO clustered just below and random forest lagging somewhat in both accuracy and discrimination.​
+
+Compared with the SUPPORT prognostic model, all four machine‑learning models trained on the SUPPORT2 predictors achieved similar or better AUCs for both time horizons.
+SUPPORT’s AUCs of about 0.79 for 2 months and 0.78 for 6 months were matched or exceeded by logistic and LASSO regression and clearly surpassed by GBM, indicating that modest gains in discrimination are achievable with contemporary supervised learning while retaining the same underlying predictor information.​
+
+#### Effect of physician estimates
+
+Adding physician 2‑month survival estimates (*prg2m*) to the GBM model for 2‑month survival increased AUC from 0.81 to 0.83 and accuracy from 0.77 to 0.79, with a corresponding improvement in sensitivity and only a small change in specificity.
+Similarly, including *prg6m* for 6‑month survival raised GBM AUC from 0.81 to 0.82 and accuracy from 0.73 to 0.75, again with higher sensitivity and acceptable specificity, suggesting that physician judgement contributes independent prognostic information beyond routinely collected clinical variables.​
+
+These add‑on GBM models achieved these gains with substantially lower training time than the fully tuned base GBM models, owing to the lighter tuning grid and simpler 10‑fold cross‑validation used for the physician‑augmented analyses.
+The ROC panels confirm visually that the GBM + physician models dominate the other curves across most of the false‑positive rate range for both 2‑ and 6‑month survival, reinforcing their role as the best‑performing models in this exercise.
+
+### Conclusion
+
+The first hypothesis was supported, with GBM and penalized regression achieving higher AUCs than SUPPORT for both short‑ and medium‑term survival.
+
+The second hypothesis was only partially supported: GBM consistently outperformed logistic and LASSO regression, but random forest did not offer clear advantages in this dataset.​
+
+The third hypothesis was supported for the gradient boosting model at both time horizons.
+GBM models augmented with *prg2m* and *prg6m* delivered the highest AUC and accuracy of all tested models, indicating that physician judgement contains prognostically useful information not fully captured by baseline clinical variables and strengthening the case for integrating structured clinician estimates into risk‑prediction tools in this setting.\

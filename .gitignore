@@ -1,0 +1,27 @@
+# R
+
+.Rhistory
+.RData
+.Ruserdata
+
+# RStudio
+
+.Rproj.user/
+
+# R Markdown artifacts
+
+*_cache/
+*_files/
+
+# Package libraries
+
+renv/library/
+renv/staging/
+
+# OS files
+
+.DS_Store
+
+# Temporary files
+
+*.tmp
