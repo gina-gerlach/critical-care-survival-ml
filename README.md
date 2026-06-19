@@ -68,14 +68,14 @@ Evaluation metrics included:
 
 Gradient Boosting achieved the strongest overall performance across both prediction horizons.
 
-| Model                     | 2-Month AUC | 6-Month AUC |
-| ------------------------- | ----------- | ----------- |
-| SUPPORT                   | ~0.80       | ~0.78       |
-| Logistic Regression       | 0.81        | 0.79        |
-| LASSO Logistic Regression | 0.81        | 0.79        |
-| Random Forest             | 0.78        | 0.78        |
-| Gradient Boosting         | 0.81        | 0.81        |
-| GBM + Physician Estimate  | 0.83        | 0.82        |
+| Model | 2-Month AUC | 6-Month AUC |
+|---|---:|---:|
+| SUPPORT | ~0.80 | ~0.78 |
+| Logistic Regression | 0.81 | 0.79 |
+| LASSO Logistic Regression | 0.81 | 0.79 |
+| Random Forest | 0.78 | 0.78 |
+| Gradient Boosting | 0.81 | 0.81 |
+| GBM + Physician Estimate | 0.83 | 0.82 |
 
 Performance declined modestly at the 6-month horizon across all models, reflecting increasing uncertainty over longer prediction windows.
 
@@ -131,7 +131,7 @@ https://archive.ics.uci.edu/dataset/880/support2
 To reproduce this analysis:
 
 1. Download `support2.csv` from the UCI repository.
-2. Place the file in this directory.
+2. Place `support2.csv` in a local `data/` folder before running the notebook.
 3. Run the notebook in `notebooks/`.
 
 All preprocessing, feature engineering, model development, and evaluation steps are documented in the notebook.
